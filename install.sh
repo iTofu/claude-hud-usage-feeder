@@ -179,9 +179,12 @@ if config_dir != os.path.join(os.path.expanduser("~"), ".claude"):
 with open(path, "wb") as handle:
     plistlib.dump({
         "Label": label,
-        # The script writes its own log; letting launchd also capture stdio
-        # would just duplicate it and grow unbounded.
-        "ProgramArguments": ["/usr/bin/env", "python3", script],
+        # Exec the script directly rather than via `/usr/bin/env python3`.
+        # macOS names background items after argv[0], so the latter shows up in
+        # System Settings > Login Items as a bare "env" -- unidentifiable to
+        # anyone auditing what runs on their machine. The shebang resolves
+        # python3 through the PATH set below.
+        "ProgramArguments": [script],
         "EnvironmentVariables": env,
         "StartInterval": int(interval),
         "RunAtLoad": True,
