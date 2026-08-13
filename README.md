@@ -37,6 +37,7 @@ cd claude-hud-usage-feeder
 That copies the feeder to `~/.claude/scripts/`, points claude-hud's config at the snapshot, registers a launchd agent that runs every 10 minutes, and does one run to prove it works. Re-running is safe.
 
 ```
+./install.sh --hooks                     # refresh after every turn, not on a timer
 ./install.sh --interval 300              # refresh every 5 minutes
 ./install.sh --label 'Fable=ƒ'           # rename the statusline label
 ./install.sh --no-timer                  # install only; schedule it yourself
@@ -69,6 +70,30 @@ Pin the order yourself with `HUD_FEEDER_SOURCES=oauth,cswap`, or drop one entire
 **`is_active` lies.** An enforceable scoped limit can report `is_active: false`. Filtering on it drops the very window you're trying to display. This never filters on it.
 
 **`CLAUDE_CONFIG_DIR` mutes cswap.** With that variable set — even to its own default, `~/.claude` — cswap 0.24.1 reports `managed: null` and an empty `usage` object. Inherit it into the subprocess and source 1 silently stops working while everything limps along on the slower fallbacks. It is stripped from cswap's environment here, and `install.sh` only exports it at all when it is genuinely non-default.
+
+## Refresh cadence
+
+By default a timer runs every 10 minutes. That works, but it is polling: it spends requests while you are idle and lags by up to 10 minutes while you are not.
+
+`--hooks` makes it event-driven instead. Claude Code's `Stop` and `SessionStart` events fire the feeder, so the number updates seconds after each turn — which is exactly when quota moves.
+
+```bash
+./install.sh --hooks
+```
+
+It costs no extra API requests, because each source carries its own minimum interval:
+
+| Source | Min interval | Why |
+|---|---|---|
+| cswap | 10s (debounce) | cswap enforces a **180s freshness floor internally, shared across every surface that reads it**. Calling it more often cannot produce upstream traffic: you either read its store for free or trigger the fetch it was going to make anyway. |
+| oauth | 300s | A real request each time, against a budget of ~28–30 per rolling hour per token. That budget is not a leaky bucket — a burst saturates it for a full hour — and cswap already reserves most of it. |
+| claude-cli | 600s | Same cost, plus a subprocess and a round of hooks. |
+
+A throttled source **stops the run** rather than falling through to a pricier one. Being throttled means the snapshot is already as fresh as this trigger can make it, so spending a request to learn the same number would defeat the purpose. Only a genuine failure falls through — which makes the throttle a circuit breaker too: if the cheap source starts failing silently, a per-turn trigger still cannot burn the budget.
+
+**Keep the timer even with hooks** (it relaxes to 30 minutes automatically). Quota is per identity, so anything you spend on claude.ai, the phone app, or another machine never fires your local `Stop` hook.
+
+Under an event trigger, successful runs that change nothing are not logged — otherwise the log fills with identical lines. Failures always are. `HUD_FEEDER_VERBOSE=1` logs every decision, throttles included.
 
 ## Renaming the label
 

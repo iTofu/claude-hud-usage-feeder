@@ -10,6 +10,7 @@ SCRIPT=$CONFIG_DIR/scripts/claude-hud-usage-feeder.py
 HUD_CONFIG=$PLUGIN_DIR/config.json
 SNAPSHOT=$PLUGIN_DIR/usage-snapshot.json
 FEEDER_CONFIG=$PLUGIN_DIR/usage-feeder.json
+STATE_FILE=$PLUGIN_DIR/usage-feeder-state.json
 LOG=$PLUGIN_DIR/usage-feeder.log
 AGENT_LABEL=io.github.itofu.claude-hud-usage-feeder
 PLIST=$HOME/Library/LaunchAgents/$AGENT_LABEL.plist
@@ -50,13 +51,64 @@ else
 fi
 
 step "Removing files"
-for path in "$SCRIPT" "$SNAPSHOT" "$FEEDER_CONFIG"; do
+for path in "$SCRIPT" "$SNAPSHOT" "$FEEDER_CONFIG" "$STATE_FILE"; do
   if [ -e "$path" ]; then /bin/rm -f "$path"; info "$path"; fi
 done
 if [ "$KEEP_LOG" -eq 0 ] && [ -e "$LOG" ]; then
   /bin/rm -f "$LOG"
   info "$LOG"
 fi
+
+step "Removing event hooks"
+python3 - "$CONFIG_DIR/settings.json" "$SCRIPT" remove <<'PY'
+import json, os, shutil, sys, time
+
+path, script, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+EVENTS = ("Stop", "SessionStart")
+
+if not os.path.exists(path):
+    print("  no settings.json")
+    raise SystemExit(0)
+
+with open(path) as handle:
+    try:
+        settings = json.load(handle)
+    except ValueError:
+        print("  settings.json is not valid JSON; leaving it alone")
+        raise SystemExit(0)
+
+before = json.dumps(settings, sort_keys=True)
+hooks = settings.get("hooks") or {}
+
+for event in EVENTS:
+    groups = []
+    for group in hooks.get(event) or []:
+        entries = [h for h in (group.get("hooks") or [])
+                   if script not in (h.get("command") or "")]
+        if entries:
+            groups.append(dict(group, hooks=entries))
+    if groups:
+        hooks[event] = groups
+    else:
+        hooks.pop(event, None)
+
+if hooks:
+    settings["hooks"] = hooks
+else:
+    settings.pop("hooks", None)
+
+if json.dumps(settings, sort_keys=True) == before:
+    print("  no hooks to remove")
+    raise SystemExit(0)
+
+backup = "%s.bak.%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+shutil.copy2(path, backup)
+print("  backed up to %s" % backup)
+with open(path, "w") as handle:
+    json.dump(settings, handle, indent=2)
+    handle.write("\n")
+print("  removed from %s" % ", ".join(EVENTS))
+PY
 
 step "Reverting claude-hud config"
 python3 - "$HUD_CONFIG" <<'PY'

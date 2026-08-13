@@ -54,7 +54,15 @@ Environment overrides (all optional)
     HUD_FEEDER_LABELS      JSON map renaming statusline labels, keys matched
                            case-insensitively, e.g. {"fable": "f"}
     HUD_FEEDER_SOURCES     Comma-separated subset/order of cswap,oauth,claude-cli
+    HUD_FEEDER_VERBOSE     Log every run, including throttled and unchanged ones
     CSWAP_BIN / CLAUDE_BIN Absolute paths to those binaries
+
+Cadence
+    Safe to trigger as often as you like -- from a Stop hook after every turn,
+    say. Each source carries its own minimum interval (see ALL_SOURCES), so a
+    frequent trigger costs nothing beyond a cached read: the cheap source
+    absorbs it and the expensive ones stay throttled. Successful runs that
+    change nothing are not logged; failures always are.
 """
 
 import json
@@ -71,6 +79,7 @@ PLUGIN_DIR = (os.environ.get("HUD_FEEDER_PLUGIN_DIR")
 SNAPSHOT = os.path.join(PLUGIN_DIR, "usage-snapshot.json")
 LOG = os.path.join(PLUGIN_DIR, "usage-feeder.log")
 CONFIG_FILE = os.path.join(PLUGIN_DIR, "usage-feeder.json")
+STATE_FILE = os.path.join(PLUGIN_DIR, "usage-feeder-state.json")
 
 LOG_MAX_BYTES = 256 * 1024
 LOG_KEEP_LINES = 200
@@ -398,13 +407,27 @@ def from_claude_cli():
     return from_limits(rate_limits)
 
 
-# Order is priority. cswap first because it TTL-gates upstream calls and never
-# touches credentials; direct OAuth second (fast, but reads a token); the
-# `claude` subprocess last because it is the slowest and fires hooks.
+# (name, fetch, min_interval_s). Order is priority.
+#
+# The intervals differ per source because the sources do not cost the same
+# thing. cswap enforces its own freshness floor internally -- 180s, shared
+# across every surface that reads it (poll_policy.SERVE_TTL_S: "an entry
+# younger than this is served from the store without any fetch ... regardless
+# of how many surfaces are open"). Calling it often therefore cannot produce
+# upstream traffic: we either read its store for free or trigger the fetch it
+# was going to make anyway. A short debounce is all it needs.
+#
+# The other two spend a real request each, against a budget of roughly 28-30
+# per rolling hour per token -- and that budget is not a leaky bucket, so a
+# burst saturates it for a full hour. cswap targets 20/hour for itself and
+# deliberately leaves the rest for other consumers; these two eat into exactly
+# that headroom, so they are throttled hard. That throttle doubles as a circuit
+# breaker: if cswap starts failing silently, a per-turn trigger still cannot
+# burn the budget.
 ALL_SOURCES = [
-    ("cswap", from_cswap),
-    ("oauth", from_oauth),
-    ("claude-cli", from_claude_cli),
+    ("cswap", from_cswap, 10),
+    ("oauth", from_oauth, 300),
+    ("claude-cli", from_claude_cli, 600),
 ]
 
 
@@ -413,8 +436,37 @@ def select_sources():
     if not wanted:
         return ALL_SOURCES
     order = [name.strip() for name in wanted.split(",") if name.strip()]
-    available = dict(ALL_SOURCES)
-    return [(name, available[name]) for name in order if name in available]
+    available = {entry[0]: entry for entry in ALL_SOURCES}
+    return [available[name] for name in order if name in available]
+
+
+def read_state():
+    """Per-source last-attempt times. Unreadable state just means no throttle."""
+    try:
+        with open(STATE_FILE) as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_state(state):
+    try:
+        handle, tmp = tempfile.mkstemp(dir=PLUGIN_DIR, prefix=".usage-feeder-state.")
+        with os.fdopen(handle, "w") as out:
+            json.dump(state, out)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+def previous_scoped():
+    """The scoped windows already on disk, for deciding whether to log."""
+    try:
+        with open(SNAPSHOT) as handle:
+            return json.dumps(json.load(handle).get("model_scoped"), sort_keys=True)
+    except Exception:
+        return None
 
 
 def write_snapshot(usage):
@@ -438,8 +490,28 @@ def main():
         log("FAIL HUD_FEEDER_SOURCES matched no known source")
         return 1
 
+    state = read_state()
+    attempts = state.setdefault("last_attempt", {})
+    now = time.time()
+    before = previous_scoped()
+    verbose = bool(os.environ.get("HUD_FEEDER_VERBOSE"))
+
     failures = []
-    for name, fetch in sources:
+    throttled = []
+    for name, fetch, min_interval in sources:
+        early = min_interval - (now - attempts.get(name, 0))
+        if early > 0:
+            # Throttled is not the same as broken, and the difference matters:
+            # this source ran moments ago, so the snapshot is already as fresh
+            # as this trigger can make it. Falling through to a pricier source
+            # here would spend a real API request to learn the same number --
+            # the exact opposite of what the throttle is for. Stop instead.
+            throttled.append("%s: %ds early" % (name, int(early)))
+            break
+        # Record the attempt before making it. A source that hangs or dies must
+        # not be retried on the very next trigger.
+        attempts[name] = now
+        write_state(state)
         try:
             usage = fetch()
         except Exception as err:
@@ -451,20 +523,35 @@ def main():
             failures.append("%s: no scoped windows" % name)
             continue
         write_snapshot(usage)
-        # Record skipped sources too. Otherwise an earlier source can fail
-        # silently for months and the log still reads like everything is fine.
-        log("OK via %s -- %s%s" % (
-            name,
-            ", ".join("%s %s%%" % (w["display_name"], w["utilization"])
-                      for w in usage["model_scoped"]),
-            " [skipped: %s]" % "; ".join(failures) if failures else "",
-        ))
+        # With an event trigger this runs once per turn, so logging every
+        # success would bury the interesting lines under identical ones. Log
+        # when the numbers moved, when something went wrong on the way, or on
+        # demand. Failures are never suppressed -- the log stays the only
+        # signal that this thing died.
+        after = json.dumps(usage["model_scoped"], sort_keys=True)
+        if verbose or failures or after != before:
+            log("OK via %s -- %s%s" % (
+                name,
+                ", ".join("%s %s%%" % (w["display_name"], w["utilization"])
+                          for w in usage["model_scoped"]),
+                " [skipped: %s]" % "; ".join(failures) if failures else "",
+            ))
         return 0
 
-    # Leave the old snapshot alone when everything fails: it expires on its own
-    # and claude-hud then hides the segment, which beats showing a stale number
-    # as if it were current.
-    log("FAIL all sources (%s), snapshot left untouched" % "; ".join(failures))
+    if not failures:
+        # Nothing ran because nothing was due. This is the normal quiet path
+        # under an event trigger and costs a few milliseconds.
+        if verbose:
+            log("skip -- %s" % "; ".join(throttled))
+        return 0
+
+    # Leave the old snapshot alone when a source actually failed: it expires on
+    # its own and claude-hud then hides the segment, which beats showing a stale
+    # number as if it were current.
+    log("FAIL %s%s, snapshot left untouched" % (
+        "; ".join(failures),
+        " [not tried: %s]" % "; ".join(throttled) if throttled else "",
+    ))
     return 1
 
 

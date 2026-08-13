@@ -17,7 +17,10 @@ PLIST=$HOME/Library/LaunchAgents/$AGENT_LABEL.plist
 
 INTERVAL=600
 FRESHNESS_MS=1800000
+INTERVAL_SET=0
+FRESHNESS_SET=0
 INSTALL_TIMER=1
+INSTALL_HOOKS=0
 LABEL_PAIRS=()
 
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -35,6 +38,15 @@ Usage: ./install.sh [options]
                        not blank the segment.
   --label FROM=TO      Rename a statusline label; repeatable.
                        e.g. --label 'Fable=f'
+  --hooks              Also refresh on Claude Code's Stop and SessionStart
+                       events, so the number updates seconds after each turn
+                       instead of on the timer. Costs no extra API requests:
+                       the cheap source absorbs the calls and the expensive
+                       ones stay throttled. Edits settings.json; --no-timer
+                       is still not implied, because the timer is what catches
+                       quota you spend elsewhere (web, phone, another machine).
+                       Implies a slower timer and longer freshness unless you
+                       set them explicitly.
   --no-timer           Install the script and config only, no scheduler.
   -h, --help           This text.
 
@@ -45,9 +57,10 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --interval) INTERVAL=${2:?--interval needs a value}; shift 2 ;;
-    --freshness) FRESHNESS_MS=${2:?--freshness needs a value}; shift 2 ;;
+    --interval) INTERVAL=${2:?--interval needs a value}; INTERVAL_SET=1; shift 2 ;;
+    --freshness) FRESHNESS_MS=${2:?--freshness needs a value}; FRESHNESS_SET=1; shift 2 ;;
     --label) LABEL_PAIRS+=("${2:?--label needs FROM=TO}"); shift 2 ;;
+    --hooks) INSTALL_HOOKS=1; shift ;;
     --no-timer) INSTALL_TIMER=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
@@ -56,6 +69,14 @@ done
 
 case "$INTERVAL" in ''|*[!0-9]*) die "--interval must be a whole number of seconds" ;; esac
 case "$FRESHNESS_MS" in ''|*[!0-9]*) die "--freshness must be a whole number of milliseconds" ;; esac
+
+# With event hooks doing the work, the timer only has to catch quota spent
+# outside this machine, and the snapshot only has to survive an idle stretch --
+# during which the number is not moving anyway. Both can relax a lot.
+if [ "$INSTALL_HOOKS" -eq 1 ]; then
+  [ "$INTERVAL_SET" -eq 1 ] || INTERVAL=1800
+  [ "$FRESHNESS_SET" -eq 1 ] || FRESHNESS_MS=3600000
+fi
 
 # --- preflight -------------------------------------------------------------
 
@@ -156,6 +177,66 @@ with open(config_path, "w") as handle:
 for key, value in changed.items():
     print("  display.%s = %s" % (key, value))
 PY
+
+# --- event hooks -----------------------------------------------------------
+
+if [ "$INSTALL_HOOKS" -eq 1 ]; then
+  step "Installing event hooks"
+  python3 - "$CONFIG_DIR/settings.json" "$SCRIPT" install <<'PY'
+import json, os, shutil, sys, time
+
+path, script, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+EVENTS = ("Stop", "SessionStart")
+# Detached on purpose: a hook that blocks is a hook you feel on every turn.
+command = "%s >/dev/null 2>&1 &" % script
+
+settings = {}
+if os.path.exists(path):
+    with open(path) as handle:
+        try:
+            settings = json.load(handle)
+        except ValueError:
+            sys.exit("  %s is not valid JSON; fix it, then re-run" % path)
+
+before = json.dumps(settings, sort_keys=True)
+hooks = settings.get("hooks") or {}
+
+for event in EVENTS:
+    # Drop any entry of ours first, so re-running never stacks duplicates,
+    # then re-add. Everything else in the file is left exactly as it was.
+    groups = []
+    for group in hooks.get(event) or []:
+        entries = [h for h in (group.get("hooks") or [])
+                   if script not in (h.get("command") or "")]
+        if entries:
+            groups.append(dict(group, hooks=entries))
+    if mode == "install":
+        groups.append({"hooks": [{"type": "command", "command": command}]})
+    if groups:
+        hooks[event] = groups
+    else:
+        hooks.pop(event, None)
+
+if hooks:
+    settings["hooks"] = hooks
+else:
+    settings.pop("hooks", None)
+
+if json.dumps(settings, sort_keys=True) == before:
+    print("  already configured, left untouched")
+    raise SystemExit(0)
+
+if os.path.exists(path):
+    backup = "%s.bak.%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(path, backup)
+    print("  backed up to %s" % backup)
+
+with open(path, "w") as handle:
+    json.dump(settings, handle, indent=2)
+    handle.write("\n")
+print("  %s -> %s" % (", ".join(EVENTS), path))
+PY
+fi
 
 # --- schedule --------------------------------------------------------------
 
