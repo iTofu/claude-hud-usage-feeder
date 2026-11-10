@@ -1,3 +1,12 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# handoff-skills session snapshots (https://github.com/iTofu/handoff-skills)
+.handoff/
+
+# Claude Code
+CLAUDE.local.md
+**/.claude/*.local.md
+**/.claude/*.local.json
+.claude/*.lock
